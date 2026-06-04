@@ -1,1 +1,145 @@
+import os
+import torch
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import warnings
 
+# 忽略 librosa 與 transformers 的部分警告訊息以保持終端機整潔
+warnings.filterwarnings('ignore')
+
+class AnimalIntentDecoder:
+    def __init__(self, model_id="Qwen/Qwen-VL-Chat"):
+        """
+        初始化動物意圖解碼器，負責載入多模態語言模型與設定硬體。
+        """
+        self.model_id = model_id
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        print(f"[系統初始化] 準備使用設備: {self.device}")
+        if self.device == "cpu":
+            print("[警告] 未偵測到 GPU，執行速度將會非常緩慢。")
+
+        print(f"[載入模型] 正在從 Hugging Face 載入 {self.model_id}...")
+        
+        # 載入 Tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_id, 
+            trust_remote_code=True
+        )
+        
+        # 載入模型 (使用 float16 以節省記憶體，若顯存不足可考慮安裝 bitsandbytes 並加上 load_in_4bit=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_id, 
+            device_map=self.device, 
+            trust_remote_code=True,
+            torch_dtype=torch.float16
+        ).eval()
+        
+        print("[載入完成] 模型已準備就緒。")
+
+    def audio_to_mfcc_image(self, audio_path, output_image_path):
+        """
+        將音檔轉換為 MFCC 特徵圖並存成圖片。
+        """
+        print(f"[特徵提取] 正在處理音訊: {audio_path}")
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"找不到音檔：{audio_path}")
+
+        try:
+            # 載入音檔
+            y, sr = librosa.load(audio_path, sr=None)
+            
+            # 提取 MFCC 特徵
+            mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+            
+            # 建立圖表 (不顯示座標軸，只保留純特徵矩陣的視覺化)
+            plt.figure(figsize=(10, 4))
+            librosa.display.specshow(mfccs, sr=sr, x_axis=None, y_axis=None)
+            plt.axis('off')
+            
+            # 儲存圖片
+            os.makedirs(os.path.dirname(os.path.abspath(output_image_path)), exist_ok=True)
+            plt.savefig(output_image_path, bbox_inches='tight', pad_inches=0)
+            plt.close()
+            
+            print(f"[特徵提取] 成功生成聲音特徵圖: {output_image_path}")
+            return output_image_path
+        except Exception as e:
+            print(f"[錯誤] 轉換音檔 {audio_path} 失敗: {e}")
+            return None
+
+    def predict(self, action_image_path, audio_path, mfcc_output_path="temp_mfcc.png"):
+        """
+        整合影像與音訊，進行多模態意圖推論。
+        """
+        if not os.path.exists(action_image_path):
+            raise FileNotFoundError(f"找不到行為圖片：{action_image_path}")
+
+        # 1. 將音訊轉換為視覺特徵圖
+        mfcc_image_path = self.audio_to_mfcc_image(audio_path, mfcc_output_path)
+        if not mfcc_image_path:
+            return "無法生成音訊特徵圖，推論中止。"
+
+        # 2. 建構 Qwen-VL 的多模態輸入格式
+        print("[推論中] 模型正在綜合視覺與聽覺特徵分析意圖...")
+        query = self.tokenizer.from_list_format([
+            {'image': action_image_path},
+            {'image': mfcc_image_path},
+            {'text': '第一張圖是動物的行為動作，第二張圖是該動物發出聲音的 MFCC 特徵頻譜圖。請綜合視覺與聽覺特徵，判斷這隻動物現在的意圖是什麼？請給出明確的結論（如：飢餓、警戒、放鬆、請求注意）並簡述判斷依據。'}
+        ])
+        
+        # 3. 執行生成
+        inputs = self.tokenizer(query, return_tensors='pt').to(self.device)
+        
+        # 使用 torch.no_grad() 節省記憶體
+        with torch.no_grad():
+            pred = self.model.generate(
+                **inputs, 
+                max_new_tokens=256,
+                temperature=0.7,
+                do_sample=True
+            )
+            
+        # 解碼輸出
+        response = self.tokenizer.decode(pred.cpu()[0], skip_special_tokens=True)
+        
+        # 清理暫存檔案 (可選)
+        if os.path.exists(mfcc_output_path):
+            os.remove(mfcc_output_path)
+            
+        return response
+
+if __name__ == "__main__":
+    # ==========================================
+    # 測試執行區塊
+    # ==========================================
+    
+    # 請在此處替換為您本機端實際存在的檔案路徑
+    TEST_ACTION_IMAGE = "sample_cat_action.jpg"
+    TEST_AUDIO_FILE = "sample_cat_meow.wav"
+    
+    # 檢查測試檔案是否存在
+    if not os.path.exists(TEST_ACTION_IMAGE) or not os.path.exists(TEST_AUDIO_FILE):
+        print("[提示] 找不到測試用的圖片或音檔。")
+        print("請在腳本同目錄下準備以下兩個檔案才能進行測試：")
+        print(f"1. {TEST_ACTION_IMAGE} (動物行為截圖)")
+        print(f"2. {TEST_AUDIO_FILE} (動物叫聲音檔)")
+    else:
+        print("開始啟動跨物種意圖解碼器...")
+        
+        # 實例化解碼器 (初次執行會從網路下載 Qwen-VL 模型，約需十多 GB 空間)
+        decoder = AnimalIntentDecoder()
+        
+        # 執行推論
+        result = decoder.predict(
+            action_image_path=TEST_ACTION_IMAGE,
+            audio_path=TEST_AUDIO_FILE
+        )
+        
+        print("\n" + "="*50)
+        print("解碼結果：")
+        print("="*50)
+        print(result)
+        print("="*50)
